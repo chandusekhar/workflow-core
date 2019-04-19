@@ -15,6 +15,7 @@ namespace WorkflowCore.Services.BackgroundTasks
         private readonly ObjectPool<IPersistenceProvider> _persistenceStorePool;
         private readonly ObjectPool<IWorkflowExecutor> _executorPool;
 
+        protected override int MaxConcurrentItems => Options.MaxConcurrentWorkflows;
         protected override QueueType Queue => QueueType.Workflow;
 
         public WorkflowConsumer(IPooledObjectPolicy<IPersistenceProvider> persistencePoolPolicy, IQueueProvider queueProvider, ILoggerFactory loggerFactory, IServiceProvider serviceProvider, IWorkflowRegistry registry, IDistributedLockProvider lockProvider, IPooledObjectPolicy<IWorkflowExecutor> executorPoolPolicy, IDateTimeProvider datetimeProvider, WorkflowOptions options)
@@ -28,60 +29,60 @@ namespace WorkflowCore.Services.BackgroundTasks
 
         protected override async Task ProcessItem(string itemId, CancellationToken cancellationToken)
         {
-            if (await _lockProvider.AcquireLock(itemId, cancellationToken))
+            if (!await _lockProvider.AcquireLock(itemId, cancellationToken))
             {
-                WorkflowInstance workflow = null;
-                WorkflowExecutorResult result = null;
-                var persistenceStore = _persistenceStorePool.Get();
+                Logger.LogInformation("Workflow locked {0}", itemId);
+                return;
+            }
+            
+            WorkflowInstance workflow = null;
+            WorkflowExecutorResult result = null;
+            var persistenceStore = _persistenceStorePool.Get();
+            try
+            {
                 try
                 {
-                    try
+                    cancellationToken.ThrowIfCancellationRequested();
+                    workflow = await persistenceStore.GetWorkflowInstance(itemId);
+                    if (workflow.Status == WorkflowStatus.Runnable)
                     {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        workflow = await persistenceStore.GetWorkflowInstance(itemId);
-                        if (workflow.Status == WorkflowStatus.Runnable)
+                        var executor = _executorPool.Get();
+                        try
                         {
-                            var executor = _executorPool.Get();
-                            try
-                            {
-                                result = await executor.Execute(workflow);
-                            }
-                            finally
-                            {
-                                _executorPool.Return(executor);
-                                await persistenceStore.PersistWorkflow(workflow);
-                            }
+                            result = await executor.Execute(workflow);
                         }
-                    }
-                    finally
-                    {
-                        await _lockProvider.ReleaseLock(itemId);
-                        if ((workflow != null) && (result != null))
+                        finally
                         {
-                            foreach (var sub in result.Subscriptions)
-                            {
-                                await SubscribeEvent(sub, persistenceStore);
-                            }
-
-                            await persistenceStore.PersistErrors(result.Errors);
-
-                            var readAheadTicks = _datetimeProvider.Now.Add(Options.PollInterval).ToUniversalTime().Ticks;
-
-                            if ((workflow.Status == WorkflowStatus.Runnable) && workflow.NextExecution.HasValue && workflow.NextExecution.Value < readAheadTicks)
-                            {
-                                new Task(() => FutureQueue(workflow, cancellationToken)).Start();
-                            }
+                            _executorPool.Return(executor);
+                            await persistenceStore.PersistWorkflow(workflow);
+                            await QueueProvider.QueueWork(itemId, QueueType.Index);
                         }
                     }
                 }
                 finally
                 {
-                    _persistenceStorePool.Return(persistenceStore);
+                    await _lockProvider.ReleaseLock(itemId);
+                    if ((workflow != null) && (result != null))
+                    {
+                        foreach (var sub in result.Subscriptions)
+                        {
+                            await SubscribeEvent(sub, persistenceStore);
+                        }
+
+                        await persistenceStore.PersistErrors(result.Errors);
+
+                        var readAheadTicks = _datetimeProvider.Now.Add(Options.PollInterval).ToUniversalTime().Ticks;
+
+                        if ((workflow.Status == WorkflowStatus.Runnable) && workflow.NextExecution.HasValue && workflow.NextExecution.Value < readAheadTicks)
+                        {
+                            new Task(() => FutureQueue(workflow, cancellationToken)).Start();
+                        }
+                    }
                 }
             }
-            else
+            finally
             {
-                Logger.LogInformation("Workflow locked {0}", itemId);
+                _persistenceStorePool.Return(persistenceStore);
             }
         }
         
